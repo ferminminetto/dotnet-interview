@@ -17,5 +17,14 @@ public class TodoContext : DbContext
             .WithOne()
             .HasForeignKey(t => t.TodoListId)
             .OnDelete(DeleteBehavior.Cascade);
+
+        // Configure concurrency token
+        modelBuilder.Entity<TodoList>()
+            .Property(t => t.RowVersion)
+            .IsRowVersion();
+
+        modelBuilder.Entity<TodoItem>()
+            .Property(t => t.RowVersion)
+            .IsRowVersion();
     }
 }
