@@ -56,33 +56,77 @@ public sealed class ExternalTodoApiSyncService(
     // Test-only wrapper to run a single sync tick from unit tests.
     internal Task RunOneSyncForTests(CancellationToken ct) => SyncOnce(ct);
 
-    // One Cycle: Pull (externo/local) → Reconcile → Push/Apply
+    // One Cycle: Pull (external/local) → Reconcile → Push/Apply
     private async Task SyncOnce(CancellationToken ct)
     {
         using var scope = _scopeFactory.CreateScope();
         var context = scope.ServiceProvider.GetRequiredService<TodoContext>();
         var client = scope.ServiceProvider.GetRequiredService<IExternalTodoApiClient>();
 
-        _logger.LogInformation("Sync: loading external lists");
-        var externalLists = await client.ListTodoListsAsync(ct);
+        // Pull phase
+        var externalLists = await LoadExternalAsync(client, ct);
+        var localLists = await LoadLocalAsync(context, ct);
 
-        _logger.LogInformation("Sync: loading local lists");
-        var localLists = await context.TodoList
-            .Include(t => t.Items)
-            .ToListAsync(ct);
+        // Build indexes for fast matching
+        var (extById, extBySourceId) = BuildExternalIndexes(externalLists);
+        var (localByExternalId, localById) = BuildLocalIndexes(localLists);
 
-        // External: Create indexes using Dictionaries so we can do fast lookups later.
-        var extById = externalLists.Where(x => !string.IsNullOrWhiteSpace(x.Id))
-            .ToDictionary(x => x.Id!, x => x);
-        var extBySourceId = externalLists.Where(x => !string.IsNullOrWhiteSpace(x.SourceId))
-            .ToDictionary(x => x.SourceId!, x => x);
+        // Reconcile linking (by source_id)
+        LinkListsBySourceId(localLists, extBySourceId);
 
-        // Same indexing for internal lists.
-        var localByExternalId = localLists.Where(x => !string.IsNullOrWhiteSpace(x.ExternalId))
-            .ToDictionary(x => x.ExternalId!, x => x);
-        var localById = localLists.ToDictionary(x => x.Id, x => x);
+        // Create missing local entities based on external snapshot
+        CreateMissingLocal(context, externalLists, localByExternalId, localById);
 
-        // If one of the lists has ExternalId but the other doesn't, we can link them by SourceId/Id.
+        // Create missing remote entities based on local snapshot
+        await CreateMissingRemoteAsync(client, localLists, extById, extBySourceId, ct);
+
+        // Apply updates both ways (lists and items) with LWW (Last Writer Wins) strategy
+        await SyncListsAndItemsAsync(client, localLists, extById, ct);
+
+        // Persist changes
+        await context.SaveChangesAsync(ct);
+
+        _logger.LogInformation("Sync: completed. Local lists: {LocalCount} | External lists: {ExternalCount}",
+            localLists.Count, externalLists.Count);
+    }
+
+    private static async Task<List<ExternalTodoList>> LoadExternalAsync(IExternalTodoApiClient client, CancellationToken ct)
+        => await client.ListTodoListsAsync(ct);
+
+    private static async Task<List<TodoList>> LoadLocalAsync(TodoContext context, CancellationToken ct)
+        => await context.TodoList.Include(t => t.Items).ToListAsync(ct);
+
+    // Build both external indexes in a single pass
+    private static (Dictionary<string, ExternalTodoList> byId, Dictionary<string, ExternalTodoList> bySourceId)
+        BuildExternalIndexes(List<ExternalTodoList> externalLists)
+    {
+        var byId = new Dictionary<string, ExternalTodoList>(StringComparer.Ordinal);
+        var bySourceId = new Dictionary<string, ExternalTodoList>(StringComparer.Ordinal);
+        foreach (var e in externalLists)
+        {
+            if (!string.IsNullOrWhiteSpace(e.Id)) byId[e.Id!] = e;
+            if (!string.IsNullOrWhiteSpace(e.SourceId)) bySourceId[e.SourceId!] = e;
+        }
+        return (byId, bySourceId);
+    }
+
+    // Build both local indexes in a single pass
+    private static (Dictionary<string, TodoList> byExternalId, Dictionary<long, TodoList> byId)
+        BuildLocalIndexes(List<TodoList> localLists)
+    {
+        var byExternalId = new Dictionary<string, TodoList>(StringComparer.Ordinal);
+        var byId = new Dictionary<long, TodoList>();
+        foreach (var l in localLists)
+        {
+            byId[l.Id] = l;
+            if (!string.IsNullOrWhiteSpace(l.ExternalId)) byExternalId[l.ExternalId!] = l;
+        }
+        return (byExternalId, byId);
+    }
+
+    private static void LinkListsBySourceId(List<TodoList> localLists, Dictionary<string, ExternalTodoList> extBySourceId)
+    {
+        // If one of the lists has ExternalId but the other doesn't, link them by SourceId/Id.
         foreach (var list in localLists.Where(l => string.IsNullOrWhiteSpace(l.ExternalId)))
         {
             if (extBySourceId.TryGetValue(list.Id.ToString(), out var ext))
@@ -91,19 +135,23 @@ public sealed class ExternalTodoApiSyncService(
                 list.UpdatedAt = DateTime.UtcNow;
             }
         }
+    }
 
-        // Create locally items that only exist externally.
+    private static void CreateMissingLocal(
+        TodoContext context,
+        List<ExternalTodoList> externalLists,
+        Dictionary<string, TodoList> localByExternalId,
+        Dictionary<long, TodoList> localById)
+    {
         foreach (var ext in externalLists)
         {
             TodoList? linkedLocal = null;
 
-            // Match by ExternalId first
             if (!string.IsNullOrWhiteSpace(ext.Id) &&
                 localByExternalId.TryGetValue(ext.Id!, out var byExt))
             {
                 linkedLocal = byExt;
             }
-            // Match by SourceId/Id if still not matched
             else if (!string.IsNullOrWhiteSpace(ext.SourceId) &&
                      long.TryParse(ext.SourceId, out var sid) &&
                      localById.TryGetValue(sid, out var bySource))
@@ -117,8 +165,15 @@ public sealed class ExternalTodoApiSyncService(
                 context.TodoList.Add(newList);
             }
         }
+    }
 
-        // Create remotely the lists that exist locally but not externally (use mapper).
+    private static async Task CreateMissingRemoteAsync(
+        IExternalTodoApiClient client,
+        List<TodoList> localLists,
+        Dictionary<string, ExternalTodoList> extById,
+        Dictionary<string, ExternalTodoList> extBySourceId,
+        CancellationToken ct)
+    {
         foreach (var local in localLists)
         {
             var existsRemotely =
@@ -135,84 +190,108 @@ public sealed class ExternalTodoApiSyncService(
                 local.UpdatedAt = DateTime.UtcNow;
             }
         }
+    }
 
-        // Updates using last-write-wins (lists)
+    private static async Task SyncListsAndItemsAsync(
+        IExternalTodoApiClient client,
+        List<TodoList> localLists,
+        Dictionary<string, ExternalTodoList> extById,
+        CancellationToken ct)
+    {
         foreach (var local in localLists.Where(l => !string.IsNullOrWhiteSpace(l.ExternalId)))
         {
             if (!extById.TryGetValue(local.ExternalId!, out var ext))
                 continue;
 
+            // LWW for List
             var extUpdated = ext.UpdatedAt ?? DateTime.MinValue;
             var localUpdated = local.UpdatedAt;
 
             if (localUpdated > extUpdated)
             {
-                // Push list fields (use mapper for body)
                 await client.UpdateTodoListAsync(ext.Id!, TodoListMapper.ToUpdateBody(local), ct);
             }
             else if (extUpdated > localUpdated)
             {
-                // Pull external changes into local
                 local.Name = ext.Name ?? local.Name;
                 local.UpdatedAt = extUpdated;
             }
 
-            // Items LWW
-            var extItems = ext.TodoItems ?? [];
-            var extItemsById = extItems.Where(i => !string.IsNullOrWhiteSpace(i.Id))
-                .ToDictionary(i => i.Id!, i => i);
+            // Items LWW and reconciliation
+            await SyncItemsLwwAndReconcileAsync(local, ext, client, ct);
+        }
+    }
 
-            var localItemsByExtId = local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId))
-                .ToDictionary(i => i.ExternalId!, i => i);
-
-            // Link by source_id when local item has no ExternalId
-            foreach (var li in local.Items.Where(i => string.IsNullOrWhiteSpace(i.ExternalId)))
-            {
-                var match = extItems.FirstOrDefault(i => i.SourceId == li.Id.ToString());
-                if (match is not null) li.ExternalId = match.Id;
-            }
-
-            // Create locally the items that only exist externally (use mapper)
-            foreach (var extItem in extItems)
-            {
-                var matchLocal = (!string.IsNullOrWhiteSpace(extItem.Id) && localItemsByExtId.TryGetValue(extItem.Id!, out var byExtItem))
-                    ? byExtItem
-                    : local.Items.FirstOrDefault(i => extItem.SourceId == i.Id.ToString());
-
-                if (matchLocal is null)
-                {
-                    local.Items.Add(TodoItemMapper.ToEntity(extItem));
-                }
-            }
-
-            // Push item updates where local is newer
-            foreach (var li in local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId)))
-            {
-                var hasExt = extItemsById.TryGetValue(li.ExternalId!, out var ei);
-                if (!hasExt) continue;
-
-                var liUpdated = li.UpdatedAt ?? DateTime.MinValue;
-                var eiUpdated = ei.UpdatedAt ?? DateTime.MinValue;
-
-                if (liUpdated > eiUpdated)
-                {
-                    await client.UpdateTodoItemAsync(ext.Id!, ei.Id!, TodoItemMapper.ToUpdateBody(li), ct);
-                }
-                else if (eiUpdated > liUpdated)
-                {
-                    li.Name = ei.Description ?? li.Name;
-                    li.IsComplete = ei.Completed ?? li.IsComplete;
-                    li.UpdatedAt = eiUpdated;
-                }
-            }
-
-            // Optional: deletions policy (compare collections and decide where to delete)
+    // Make it async and avoid O(n^2) linking by building extItemsBySourceId
+    private static async Task SyncItemsLwwAndReconcileAsync(
+        TodoList local,
+        ExternalTodoList ext,
+        IExternalTodoApiClient client,
+        CancellationToken ct)
+    {
+        var extItems = ext.TodoItems ?? [];
+        var extItemsById = new Dictionary<string, ExternalTodoItem>(StringComparer.Ordinal);
+        var extItemsBySourceId = new Dictionary<string, ExternalTodoItem>(StringComparer.Ordinal);
+        foreach (var ei in extItems)
+        {
+            if (!string.IsNullOrWhiteSpace(ei.Id)) extItemsById[ei.Id!] = ei;
+            if (!string.IsNullOrWhiteSpace(ei.SourceId)) extItemsBySourceId[ei.SourceId!] = ei;
         }
 
-        // Persist local changes
-        await context.SaveChangesAsync(ct);
+        var localItemsByExtId = local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId))
+            .ToDictionary(i => i.ExternalId!, i => i, StringComparer.Ordinal);
 
-        _logger.LogInformation("Sync: completed. Local lists: {LocalCount} | External lists: {ExternalCount}",
-            localLists.Count, externalLists.Count);
+        // Link by source_id when local item has no ExternalId
+        foreach (var li in local.Items.Where(i => string.IsNullOrWhiteSpace(i.ExternalId)))
+        {
+            if (extItemsBySourceId.TryGetValue(li.Id.ToString(), out var match))
+            {
+                li.ExternalId = match.Id;
+            }
+        }
+
+        // Create locally the items that only exist externally (use mapper)
+        foreach (var extItem in extItems)
+        {
+            var matched =
+                (!string.IsNullOrWhiteSpace(extItem.Id) && localItemsByExtId.ContainsKey(extItem.Id!)) ||
+                local.Items.Any(i => extItem.SourceId == i.Id.ToString());
+
+            if (!matched)
+            {
+                local.Items.Add(TodoItemMapper.ToEntity(extItem));
+            }
+        }
+
+        // Push/Pull for items (LWW)
+        await PushPullItemsAsync(local, extItemsById, client, ext.Id!, ct);
+    }
+
+    private static async Task PushPullItemsAsync(
+        TodoList local,
+        Dictionary<string, ExternalTodoItem> extItemsById,
+        IExternalTodoApiClient client,
+        string externalListId,
+        CancellationToken ct)
+    {
+        foreach (var li in local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId)))
+        {
+            var hasExt = extItemsById.TryGetValue(li.ExternalId!, out var ei);
+            if (!hasExt || ei is null) continue;
+
+            var liUpdated = li.UpdatedAt ?? DateTime.MinValue;
+            var eiUpdated = ei.UpdatedAt ?? DateTime.MinValue;
+
+            if (liUpdated > eiUpdated)
+            {
+                await client.UpdateTodoItemAsync(externalListId, ei.Id!, TodoItemMapper.ToUpdateBody(li), ct);
+            }
+            else if (eiUpdated > liUpdated)
+            {
+                li.Name = ei.Description ?? li.Name;
+                li.IsComplete = ei.Completed ?? li.IsComplete;
+                li.UpdatedAt = eiUpdated;
+            }
+        }
     }
 }
