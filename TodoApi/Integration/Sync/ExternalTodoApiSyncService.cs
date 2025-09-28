@@ -1,9 +1,10 @@
 ﻿using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Options;
+using System.Net;
 using TodoApi.Integration;
 using TodoApi.Models;
 using TodoApi.Mapping;
-using TodoApi.Options; // Use centralized mappers
+using TodoApi.Options;
 
 namespace TodoApi.Sync;
 
@@ -74,10 +75,13 @@ public sealed class ExternalTodoApiSyncService(
         // Reconcile linking (by source_id)
         LinkListsBySourceId(localLists, extBySourceId);
 
+        // Graceful deletes (local → remote) before any create/update
+        await DeleteMarkedAsync(client, localLists, ct);
+
         // Create missing local entities based on external snapshot
         CreateMissingLocal(context, externalLists, localByExternalId, localById);
 
-        // Create missing remote entities based on local snapshot
+        // Create missing remote entities based on local snapshot (skip deleted)
         await CreateMissingRemoteAsync(client, localLists, extById, extBySourceId, ct);
 
         // Apply updates both ways (lists and items) with LWW (Last Writer Wins) strategy
@@ -137,6 +141,54 @@ public sealed class ExternalTodoApiSyncService(
         }
     }
 
+    // Graceful deletes: local → remote
+    private async Task DeleteMarkedAsync(IExternalTodoApiClient client, List<TodoList> localLists, CancellationToken ct)
+    {
+        // Delete lists marked as deleted (skip items of a deleted list)
+        foreach (var list in localLists.Where(l => IsDeleted(l) && !string.IsNullOrWhiteSpace(l.ExternalId)))
+        {
+            try
+            {
+                await client.DeleteTodoListAsync(list.ExternalId!, ct);
+                _logger.LogInformation("Remote delete list succeeded. LocalId={LocalId} ExternalId={ExternalId}", list.Id, list.ExternalId);
+            }
+            catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+            {
+                // Treat 404 as success (idempotent)
+                _logger.LogInformation("Remote delete list idempotent (404). LocalId={LocalId} ExternalId={ExternalId}", list.Id, list.ExternalId);
+            }
+            catch (Exception ex)
+            {
+                // Partial failure: keep tombstone and continue
+                _logger.LogWarning(ex, "Remote delete list failed. LocalId={LocalId} ExternalId={ExternalId}", list.Id, list.ExternalId);
+            }
+        }
+
+        // Delete items marked as deleted (only for lists not deleted)
+        foreach (var list in localLists.Where(l => !IsDeleted(l) && !string.IsNullOrWhiteSpace(l.ExternalId)))
+        {
+            foreach (var item in list.Items.Where(i => IsDeleted(i) && !string.IsNullOrWhiteSpace(i.ExternalId)))
+            {
+                try
+                {
+                    await client.DeleteTodoItemAsync(list.ExternalId!, item.ExternalId!, ct);
+                    _logger.LogInformation("Remote delete item succeeded. ListExtId={ListExtId} ItemExtId={ItemExtId}", list.ExternalId, item.ExternalId);
+                }
+                catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+                {
+                    _logger.LogInformation("Remote delete item idempotent (404). ListExtId={ListExtId} ItemExtId={ItemExtId}", list.ExternalId, item.ExternalId);
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogWarning(ex, "Remote delete item failed. ListExtId={ListExtId} ItemExtId={ItemExtId}", list.ExternalId, item.ExternalId);
+                }
+            }
+        }
+    }
+
+    private static bool IsDeleted(TodoList l) => l.DeletedAt != default;
+    private static bool IsDeleted(TodoItem i) => i.DeletedAt.HasValue;
+
     private static void CreateMissingLocal(
         TodoContext context,
         List<ExternalTodoList> externalLists,
@@ -176,6 +228,9 @@ public sealed class ExternalTodoApiSyncService(
     {
         foreach (var local in localLists)
         {
+            // Do not create remotely if local is marked as deleted
+            if (IsDeleted(local)) continue;
+
             var existsRemotely =
                 (!string.IsNullOrWhiteSpace(local.ExternalId) && extById.ContainsKey(local.ExternalId!))
                 || extBySourceId.ContainsKey(local.Id.ToString());
@@ -185,7 +240,6 @@ public sealed class ExternalTodoApiSyncService(
                 var body = TodoListMapper.ToCreateBody(local);
                 var created = await client.CreateTodoListAsync(body, ct);
 
-                // Link ExternalId from response
                 local.ExternalId = created.Id;
                 local.UpdatedAt = DateTime.UtcNow;
             }
@@ -200,6 +254,9 @@ public sealed class ExternalTodoApiSyncService(
     {
         foreach (var local in localLists.Where(l => !string.IsNullOrWhiteSpace(l.ExternalId)))
         {
+            // Skip LWW if list is marked as deleted (delete path already handled)
+            if (IsDeleted(local)) continue;
+
             if (!extById.TryGetValue(local.ExternalId!, out var ext))
                 continue;
 
@@ -238,11 +295,16 @@ public sealed class ExternalTodoApiSyncService(
             if (!string.IsNullOrWhiteSpace(ei.SourceId)) extItemsBySourceId[ei.SourceId!] = ei;
         }
 
-        var localItemsByExtId = local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId))
+        // Indexes O(1) for local items
+        var localActive = local.Items.Where(i => !IsDeleted(i)).ToList();
+        var localItemsByExtId = localActive.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId))
             .ToDictionary(i => i.ExternalId!, i => i, StringComparer.Ordinal);
 
-        // Link by source_id when local item has no ExternalId
-        foreach (var li in local.Items.Where(i => string.IsNullOrWhiteSpace(i.ExternalId)))
+        // Hashsets for Id and SourceId of all local items (includes tombstones)
+        var localIds = new HashSet<string>(local.Items.Select(i => i.Id.ToString()), StringComparer.Ordinal);
+
+        // Link for source_id when local item has no ExternalId
+        foreach (var li in localActive.Where(i => string.IsNullOrWhiteSpace(i.ExternalId)))
         {
             if (extItemsBySourceId.TryGetValue(li.Id.ToString(), out var match))
             {
@@ -250,12 +312,12 @@ public sealed class ExternalTodoApiSyncService(
             }
         }
 
-        // Create locally the items that only exist externally (use mapper)
+        // Create locally the items that exist only externally (avoids O(n^2))
         foreach (var extItem in extItems)
         {
             var matched =
                 (!string.IsNullOrWhiteSpace(extItem.Id) && localItemsByExtId.ContainsKey(extItem.Id!)) ||
-                local.Items.Any(i => extItem.SourceId == i.Id.ToString());
+                (!string.IsNullOrWhiteSpace(extItem.SourceId) && localIds.Contains(extItem.SourceId!)); // incluye tombstones
 
             if (!matched)
             {
@@ -274,7 +336,7 @@ public sealed class ExternalTodoApiSyncService(
         string externalListId,
         CancellationToken ct)
     {
-        foreach (var li in local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId)))
+        foreach (var li in local.Items.Where(i => !IsDeleted(i) && !string.IsNullOrWhiteSpace(i.ExternalId)))
         {
             var hasExt = extItemsById.TryGetValue(li.ExternalId!, out var ei);
             if (!hasExt || ei is null) continue;

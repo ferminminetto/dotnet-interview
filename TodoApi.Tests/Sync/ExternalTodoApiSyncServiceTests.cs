@@ -637,4 +637,198 @@ public class ExternalTodoApiSyncServiceTests
             item.IsComplete.Should().BeTrue();
         }
     }
+
+    [Fact]
+    public async Task Sync_deletes_remote_item_when_local_item_marked_deleted()
+    {
+        /*
+         * Testing that when a local TodoItem has DeletedAt set and ExternalId present,
+         * the sync calls DELETE on the external API and the item disappears from the remote list.
+         */
+
+        // Arrange
+        var services = new ServiceCollection();
+        services.AddLogging(b => b.AddDebug());
+        var dbName = $"SyncTests-DelItem-{Guid.NewGuid()}";
+        services.AddDbContext<TodoContext>(o => o.UseInMemoryDatabase(dbName));
+        services.AddSingleton<IExternalTodoApiClient, FakeExternalTodoApiClient>();
+        services.AddSingleton<IOptions<ExternalApiOptions>>(
+            new OptionsWrapper<ExternalApiOptions>(new ExternalApiOptions
+            {
+                BaseUrl = "http://localhost",
+                SyncPeriodSeconds = 3600,
+                TimeoutSeconds = 5
+            }));
+
+        var provider = services.BuildServiceProvider();
+
+        // Seed remote list + item
+        var client = (FakeExternalTodoApiClient)provider.GetRequiredService<IExternalTodoApiClient>();
+        var remoteList = await client.CreateTodoListAsync(new ExternalCreateTodoList
+        {
+            Name = "List A",
+            Items = new List<ExternalCreateTodoItem>()
+        }, CancellationToken.None);
+
+        var remoteItem = await client.UpdateTodoItemAsync(remoteList.Id!, "rem-itm-1", new ExternalUpdateTodoItem
+        {
+            Description = "To delete",
+            Completed = false,
+            SourceId = "src-1"
+        }, CancellationToken.None);
+
+        // Seed local: same list, item with DeletedAt set
+        using (var scope = provider.CreateScope())
+        {
+            var ctx = scope.ServiceProvider.GetRequiredService<TodoContext>();
+            ctx.TodoList.Add(new TodoList
+            {
+                Name = "List A",
+                ExternalId = remoteList.Id,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                UpdatedAt = DateTime.UtcNow.AddMinutes(-10),
+                Items = new List<TodoItem>
+                {
+                    new TodoItem
+                    {
+                        Name = "Local to delete",
+                        IsComplete = false,
+                        ExternalId = remoteItem.Id,
+                        CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                        UpdatedAt = DateTime.UtcNow.AddMinutes(-10),
+                        DeletedAt = DateTime.UtcNow
+                    }
+                }
+            });
+            await ctx.SaveChangesAsync();
+        }
+
+        var logger = provider.GetRequiredService<ILogger<ExternalTodoApiSyncService>>();
+        var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
+        var options = provider.GetRequiredService<IOptions<ExternalApiOptions>>();
+        var sut = new ExternalTodoApiSyncService(logger, scopeFactory, options);
+
+        // Act
+        await sut.RunOneSyncForTests(CancellationToken.None);
+
+        // Assert: remote item was deleted
+        var snapshot = (await client.ListTodoListsAsync(CancellationToken.None)).Single();
+        snapshot.TodoItems!.Any(i => i.Id == remoteItem.Id).Should().BeFalse("deleted local item must be deleted remotely as well");
+    }
+
+    [Fact]
+    public async Task Sync_deletes_remote_list_when_local_list_marked_deleted()
+    {
+        /*
+         * Testing that when a local TodoList has DeletedAt set and ExternalId present,
+         * the sync calls DELETE on the external API and the list disappears from the remote snapshot.
+         */
+
+        // Arrange
+        var services = new ServiceCollection();
+        services.AddLogging(b => b.AddDebug());
+        var dbName = $"SyncTests-DelList-{Guid.NewGuid()}";
+        services.AddDbContext<TodoContext>(o => o.UseInMemoryDatabase(dbName));
+        services.AddSingleton<IExternalTodoApiClient, FakeExternalTodoApiClient>();
+        services.AddSingleton<IOptions<ExternalApiOptions>>(
+            new OptionsWrapper<ExternalApiOptions>(new ExternalApiOptions
+            {
+                BaseUrl = "http://localhost",
+                SyncPeriodSeconds = 3600,
+                TimeoutSeconds = 5
+            }));
+
+        var provider = services.BuildServiceProvider();
+
+        // Seed remote list
+        var client = (FakeExternalTodoApiClient)provider.GetRequiredService<IExternalTodoApiClient>();
+        var remoteList = await client.CreateTodoListAsync(new ExternalCreateTodoList
+        {
+            Name = "List To Delete",
+            Items = new List<ExternalCreateTodoItem>
+            {
+                new() { Description = "Won't matter", Completed = false }
+            }
+        }, CancellationToken.None);
+
+        // Seed local: same list with DeletedAt set
+        using (var scope = provider.CreateScope())
+        {
+            var ctx = scope.ServiceProvider.GetRequiredService<TodoContext>();
+            ctx.TodoList.Add(new TodoList
+            {
+                Name = "List To Delete",
+                ExternalId = remoteList.Id,
+                CreatedAt = DateTime.UtcNow.AddMinutes(-10),
+                UpdatedAt = DateTime.UtcNow.AddMinutes(-10),
+                DeletedAt = DateTime.UtcNow, // mark list as deleted
+                Items = new List<TodoItem>()
+            });
+            await ctx.SaveChangesAsync();
+        }
+
+        var logger = provider.GetRequiredService<ILogger<ExternalTodoApiSyncService>>();
+        var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
+        var options = provider.GetRequiredService<IOptions<ExternalApiOptions>>();
+        var sut = new ExternalTodoApiSyncService(logger, scopeFactory, options);
+
+        // Act
+        await sut.RunOneSyncForTests(CancellationToken.None);
+
+        // Assert: remote list was deleted
+        var snapshot = await client.ListTodoListsAsync(CancellationToken.None);
+        snapshot.Any(l => l.Id == remoteList.Id).Should().BeFalse("deleted local list must be deleted remotely as well");
+    }
+
+    [Fact]
+    public async Task Sync_does_not_create_remote_for_deleted_local_list_without_externalId()
+    {
+        /*
+         * Testing that a local TodoList marked as deleted and without ExternalId
+         * is not created in the external API during the sync.
+         */
+
+        var services = new ServiceCollection();
+        services.AddLogging(b => b.AddDebug());
+        var dbName = $"SyncTests-DelSkipCreate-{Guid.NewGuid()}";
+        services.AddDbContext<TodoContext>(o => o.UseInMemoryDatabase(dbName));
+        services.AddSingleton<IExternalTodoApiClient, FakeExternalTodoApiClient>();
+        services.AddSingleton<IOptions<ExternalApiOptions>>(
+            new OptionsWrapper<ExternalApiOptions>(new ExternalApiOptions
+            {
+                BaseUrl = "http://localhost",
+                SyncPeriodSeconds = 3600,
+                TimeoutSeconds = 5
+            }));
+
+        var provider = services.BuildServiceProvider();
+
+        // Seed local: deleted list without ExternalId
+        using (var scope = provider.CreateScope())
+        {
+            var ctx = scope.ServiceProvider.GetRequiredService<TodoContext>();
+            ctx.TodoList.Add(new TodoList
+            {
+                Name = "Deleted Local Only",
+                CreatedAt = DateTime.UtcNow.AddMinutes(-5),
+                UpdatedAt = DateTime.UtcNow.AddMinutes(-5),
+                DeletedAt = DateTime.UtcNow, // marked as deleted
+                Items = new List<TodoItem>()
+            });
+            await ctx.SaveChangesAsync();
+        }
+
+        var logger = provider.GetRequiredService<ILogger<ExternalTodoApiSyncService>>();
+        var scopeFactory = provider.GetRequiredService<IServiceScopeFactory>();
+        var options = provider.GetRequiredService<IOptions<ExternalApiOptions>>();
+        var sut = new ExternalTodoApiSyncService(logger, scopeFactory, options);
+
+        // Act
+        await sut.RunOneSyncForTests(CancellationToken.None);
+
+        // Assert: no remote list was created
+        var client = provider.GetRequiredService<IExternalTodoApiClient>();
+        var snapshot = await client.ListTodoListsAsync(CancellationToken.None);
+        snapshot.Should().BeEmpty("deleted local lists without ExternalId should not be created remotely");
+    }
 }
