@@ -56,7 +56,7 @@ public sealed class ExternalTodoApiSyncService(
     // Test-only wrapper to run a single sync tick from unit tests.
     internal Task RunOneSyncForTests(CancellationToken ct) => SyncOnce(ct);
 
-    // Un ciclo: Pull (externo/local) → Reconcile → Push/Apply
+    // One Cycle: Pull (externo/local) → Reconcile → Push/Apply
     private async Task SyncOnce(CancellationToken ct)
     {
         using var scope = _scopeFactory.CreateScope();
@@ -185,7 +185,7 @@ public sealed class ExternalTodoApiSyncService(
                 }
             }
 
-            // Push item updates where local is newer (use mapper)
+            // Push item updates where local is newer
             foreach (var li in local.Items.Where(i => !string.IsNullOrWhiteSpace(i.ExternalId)))
             {
                 var hasExt = extItemsById.TryGetValue(li.ExternalId!, out var ei);
