@@ -8,21 +8,18 @@ using TodoApi.Sync;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Services registration MUST happen before Build()
 builder.Services
     .AddDbContext<TodoContext>(opt =>
         opt.UseSqlServer(builder.Configuration.GetConnectionString("TodoContext")))
     .AddEndpointsApiExplorer()
     .AddControllers();
 
-// Logging configuration (before Build)
 builder.Logging.ClearProviders();
 builder.Logging.AddConsole();
 
-// Bind ExternalApi options (before Build)
 builder.Services.Configure<ExternalApiOptions>(builder.Configuration.GetSection("ExternalApi"));
 
-// Choose real or fake client based on options (before Build)
+// Choose real or fake client based on options
 var useFake = builder.Configuration.GetValue<bool>("ExternalApi:UseFake");
 if (useFake)
 {
@@ -31,17 +28,10 @@ if (useFake)
 }
 else
 {
-    // Real HTTP client
-    builder.Services.AddHttpClient<IExternalTodoApiClient, ExternalTodoApiClient>((sp, http) =>
-    {
-        var opts = sp.GetRequiredService<IOptions<ExternalApiOptions>>().Value;
-        http.BaseAddress = new Uri(opts.BaseUrl);
-        http.Timeout = TimeSpan.FromSeconds(Math.Max(5, opts.TimeoutSeconds));
-        http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-    });
+    builder.Services.AddExternalTodoApiClient();
 }
 
-// Register hosted sync service (before Build)
+// Register sync service
 builder.Services.AddHostedService<ExternalTodoApiSyncService>();
 
 var app = builder.Build();
