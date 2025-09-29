@@ -13,7 +13,9 @@
     </PackageReference>
     <PackageReference Include="Microsoft.EntityFrameworkCore.InMemory" Version="7.0.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="7.0.0-*" />
+    <PackageReference Include="Microsoft.Extensions.Http.Resilience" Version="9.9.0" />
     <PackageReference Include="Microsoft.VisualStudio.Web.CodeGeneration.Design" Version="7.0.0-*" />
+    <PackageReference Include="Polly.Extensions.Http" Version="3.0.0" />
   </ItemGroup>
 
 </Project>

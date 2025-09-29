@@ -60,38 +60,65 @@ public sealed class ExternalTodoApiSyncService(
     // One Cycle: Pull (external/local) → Reconcile → Push/Apply
     private async Task SyncOnce(CancellationToken ct)
     {
+        var startTime = DateTime.UtcNow;
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+
+        int errorCount = 0;
+
         using var scope = _scopeFactory.CreateScope();
         var context = scope.ServiceProvider.GetRequiredService<TodoContext>();
         var client = scope.ServiceProvider.GetRequiredService<IExternalTodoApiClient>();
 
-        // Pull phase
-        var externalLists = await LoadExternalAsync(client, ct);
-        var localLists = await LoadLocalAsync(context, ct);
+        _logger.LogInformation("Sync cycle started at {StartTime}", startTime);
 
-        // Build indexes for fast matching
-        var (extById, extBySourceId) = BuildExternalIndexes(externalLists);
-        var (localByExternalId, localById) = BuildLocalIndexes(localLists);
+        try
+        {
+            // Pull phase
+            var externalLists = await LoadExternalAsync(client, ct);
+            var localLists = await LoadLocalAsync(context, ct);
 
-        // Reconcile linking (by source_id)
-        LinkListsBySourceId(localLists, extBySourceId);
+            // Build indexes for fast matching
+            var (extById, extBySourceId) = BuildExternalIndexes(externalLists);
+            var (localByExternalId, localById) = BuildLocalIndexes(localLists);
 
-        // Graceful deletes (local → remote) before any create/update
-        await DeleteMarkedAsync(client, localLists, ct);
+            // Reconcile linking (by source_id)
+            LinkListsBySourceId(localLists, extBySourceId);
 
-        // Create missing local entities based on external snapshot
-        CreateMissingLocal(context, externalLists, localByExternalId, localById);
+            // Graceful deletes (local → remote) before any create/update
+            await DeleteMarkedAsync(client, localLists, ct);
 
-        // Create missing remote entities based on local snapshot (skip deleted)
-        await CreateMissingRemoteAsync(client, localLists, extById, extBySourceId, ct);
+            // Create missing local entities based on external snapshot
+            int beforeCreateLocal = context.TodoList.Count();
+            CreateMissingLocal(context, externalLists, localByExternalId, localById);
 
-        // Apply updates both ways (lists and items) with LWW (Last Writer Wins) strategy
-        await SyncListsAndItemsAsync(client, localLists, extById, ct);
+            // Create missing remote entities based on local snapshot (skip deleted)
+            int beforeCreateRemote = externalLists.Count;
+            await CreateMissingRemoteAsync(client, localLists, extById, extBySourceId, ct);
+            // No reliable way to count created remotely unless you track in CreateMissingRemoteAsync
 
-        // Persist changes
-        await context.SaveChangesAsync(ct);
+            // Apply updates both ways (lists and items) with LWW (Last Writer Wins) strategy
+            await SyncListsAndItemsAsync(client, localLists, extById, ct);
+            // No reliable way to count updated unless you track in SyncListsAndItemsAsync
 
-        _logger.LogInformation("Sync: completed. Local lists: {LocalCount} | External lists: {ExternalCount}",
-            localLists.Count, externalLists.Count);
+            // Persist changes
+            await context.SaveChangesAsync(ct);
+
+            stopwatch.Stop();
+            var endTime = DateTime.UtcNow;
+
+            _logger.LogInformation("Sync cycle completed at {EndTime} (Duration: {Duration}ms)", endTime, stopwatch.ElapsedMilliseconds);
+            _logger.LogInformation("Processed: {LocalCount} local lists, {ExternalCount} external lists", localLists.Count, externalLists.Count);
+        }
+        catch (Exception ex)
+        {
+            errorCount++;
+            _logger.LogError(ex, "Sync cycle failed with error.");
+        }
+
+        if (errorCount > 0)
+        {
+            _logger.LogWarning("Sync cycle finished with {ErrorCount} errors.", errorCount);
+        }
     }
 
     private static async Task<List<ExternalTodoList>> LoadExternalAsync(IExternalTodoApiClient client, CancellationToken ct)
