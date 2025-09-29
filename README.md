@@ -47,6 +47,7 @@ The architecture uses a `BackgroundService` that runs the sync cycle every N sec
 - - Use pagination when querying the external API to avoid loading everything at once.
 - - Consider batching updates and deletes to reduce API calls and database load.
 - **Monitoring and alerts:** Add active monitoring to detect and notify about persistent failures.
+- Haven't worked on the previously existing local TODO List Api, we could add some quality of life improvements such as pagination and also add separation of layers including Service and Repository layers and not having the DbContext tightly coupled inside the controllers.
 
 ## 6. Assumptions
 
